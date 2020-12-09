@@ -2,86 +2,77 @@ package mpvipc
 
 import (
 	"fmt"
+	"log"
 	"time"
 )
 
 func ExampleConnection_Call() {
 	conn := NewConnection("/tmp/mpv_socket")
-	err := conn.Open()
-	if err != nil {
-		fmt.Print(err)
-		return
+
+	if err := conn.Open(); err != nil {
+		log.Fatalln(err)
 	}
-	defer func() {
-		_ = conn.Close()
-	}()
+	defer conn.Close()
 
 	// toggle play/pause
-	_, err = conn.Call("cycle", "pause")
+	_, err := conn.Call("cycle", "pause")
 	if err != nil {
-		fmt.Print(err)
+		log.Fatalln(err)
 	}
 
 	// increase volume by 5
 	_, err = conn.Call("add", "volume", 5)
 	if err != nil {
-		fmt.Print(err)
+		log.Fatalln(err)
 	}
 
 	// decrease volume by 3, showing an osd message and progress bar
 	_, err = conn.Call("osd-msg-bar", "add", "volume", -3)
 	if err != nil {
-		fmt.Print(err)
+		log.Fatalln(err)
 	}
 
 	// get mpv's version
 	version, err := conn.Call("get_version")
 	if err != nil {
-		fmt.Print(err)
+		log.Fatalln(err)
 	}
 	fmt.Printf("version: %f\n", version.(float64))
 }
 
 func ExampleConnection_Set() {
 	conn := NewConnection("/tmp/mpv_socket")
-	err := conn.Open()
-	if err != nil {
-		fmt.Print(err)
-		return
+	if err := conn.Open(); err != nil {
+		log.Fatalln(err)
 	}
-	defer func() {
-		_ = conn.Close()
-	}()
+	defer conn.Close()
 
 	// pause playback
-	err = conn.Set("pause", true)
-	if err != nil {
-		fmt.Print(err)
+	if err := conn.Set("pause", true); err != nil {
+		log.Fatalln(err)
 	}
 
 	// seek to the middle of file
-	err = conn.Set("percent-pos", 50)
-	if err != nil {
-		fmt.Print(err)
+	if err := conn.Set("percent-pos", 50); err != nil {
+		log.Fatalln(err)
 	}
 }
 
 func ExampleConnection_Get() {
 	conn := NewConnection("/tmp/mpv_socket")
-	err := conn.Open()
-	if err != nil {
-		fmt.Print(err)
-		return
+
+	if err := conn.Open(); err != nil {
+		log.Fatalln(err)
 	}
-	defer func() {
-		_ = conn.Close()
-	}()
+	defer conn.Close()
 
 	// see if we're paused
 	paused, err := conn.Get("pause")
 	if err != nil {
-		fmt.Print(err)
-	} else if paused.(bool) {
+		log.Fatalln(err)
+	}
+
+	if paused.(bool) {
 		fmt.Printf("we're paused!\n")
 	} else {
 		fmt.Printf("we're not paused.\n")
@@ -90,100 +81,41 @@ func ExampleConnection_Get() {
 	// see the current position in the file
 	elapsed, err := conn.Get("time-pos")
 	if err != nil {
-		fmt.Print(err)
-	} else {
-		fmt.Printf("seconds from start of video: %f\n", elapsed.(float64))
+		log.Fatalln(err)
 	}
+
+	fmt.Printf("seconds from start of video: %f\n", elapsed.(float64))
 }
 
 func ExampleConnection_ListenForEvents() {
 	conn := NewConnection("/tmp/mpv_socket")
-	err := conn.Open()
-	if err != nil {
-		fmt.Print(err)
-		return
-	}
-	defer func() {
-		_ = conn.Close()
-	}()
 
-	_, err = conn.Call("observe_property", 42, "volume")
+	if err := conn.Open(); err != nil {
+		log.Fatalln(err)
+	}
+	defer conn.Close()
+
+	_, err := conn.Call("observe_property", 42, "volume")
 	if err != nil {
-		fmt.Print(err)
+		log.Fatalln(err)
 	}
 
-	events := make(chan *Event)
-	stop := make(chan struct{})
-	go conn.ListenForEvents(events, stop)
+	events := make(chan *Event, 1)
+	time5s := time.Tick(5 * time.Second)
 
-	// print all incoming events for 5 seconds, then exit
-	go func() {
-		time.Sleep(time.Second * 5)
-		stop <- struct{}{}
-	}()
+	cancel := conn.ListenForEvents(func(ev *Event) { events <- ev })
+	defer cancel()
 
-	for event := range events {
-		if event.ID == 42 {
-			fmt.Printf("volume now is %f\n", event.Data.(float64))
-		} else {
-			fmt.Printf("received event: %s\n", event.Name)
+	for {
+		select {
+		case event := <-events:
+			if event.ID == 42 {
+				fmt.Printf("volume now is %f\n", event.Data.(float64))
+			} else {
+				fmt.Printf("received event: %s\n", event.Name)
+			}
+		case <-time5s:
+			return
 		}
-	}
-}
-
-func ExampleConnection_NewEventListener() {
-	conn := NewConnection("/tmp/mpv_socket")
-	err := conn.Open()
-	if err != nil {
-		fmt.Print(err)
-		return
-	}
-	defer func() {
-		_ = conn.Close()
-	}()
-
-	_, err = conn.Call("observe_property", 42, "volume")
-	if err != nil {
-		fmt.Print(err)
-	}
-
-	events, stop := conn.NewEventListener()
-
-	// print all incoming events for 5 seconds, then exit
-	go func() {
-		time.Sleep(time.Second * 5)
-		stop <- struct{}{}
-	}()
-
-	for event := range events {
-		if event.ID == 42 {
-			fmt.Printf("volume now is %f\n", event.Data.(float64))
-		} else {
-			fmt.Printf("received event: %s\n", event.Name)
-		}
-	}
-}
-
-func ExampleConnection_WaitUntilClosed() {
-	conn := NewConnection("/tmp/mpv_socket")
-	err := conn.Open()
-	if err != nil {
-		fmt.Print(err)
-		return
-	}
-	defer func() {
-		_ = conn.Close()
-	}()
-
-	events, stop := conn.NewEventListener()
-
-	// print events until mpv exits, then exit
-	go func() {
-		conn.WaitUntilClosed()
-		stop <- struct{}{}
-	}()
-
-	for event := range events {
-		fmt.Printf("received event: %s\n", event.Name)
 	}
 }

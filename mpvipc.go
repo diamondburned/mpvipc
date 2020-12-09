@@ -16,15 +16,12 @@ type Connection struct {
 	socketName string
 
 	lastRequest     uint
-	waitingRequests map[uint]chan *commandResult
+	waitingRequests map[uint]func(*CommandResult)
 
 	lastListener   uint
-	eventListeners map[uint]chan<- *Event
+	eventListeners map[uint]func(*Event)
 
-	lastCloseWaiter uint
-	closeWaiters    map[uint]chan struct{}
-
-	lock *sync.Mutex
+	lock sync.Mutex
 }
 
 // Event represents an event received from mpv. For a list of all possible
@@ -52,16 +49,17 @@ type Event struct {
 
 	// Data is the property value (on events triggered by observed properties)
 	Data interface{} `json:"data"`
+
+	// Error is present if Reason is "error."
+	Error string `json:"error"`
 }
 
 // NewConnection returns a Connection associated with the given unix socket
 func NewConnection(socketName string) *Connection {
 	return &Connection{
 		socketName:      socketName,
-		lock:            &sync.Mutex{},
-		waitingRequests: make(map[uint]chan *commandResult),
-		eventListeners:  make(map[uint]chan<- *Event),
-		closeWaiters:    make(map[uint]chan struct{}),
+		waitingRequests: make(map[uint]func(*CommandResult)),
+		eventListeners:  make(map[uint]func(*Event)),
 	}
 }
 
@@ -84,72 +82,87 @@ func (c *Connection) Open() error {
 	return nil
 }
 
-// ListenForEvents blocks until something is received on the stop channel (or
-// it's closed).
-// In the mean time, events received on the socket will be sent on the events
-// channel. They may not appear in the same order they happened in.
-//
-// The events channel is closed automatically just before this method returns.
-func (c *Connection) ListenForEvents(events chan<- *Event, stop <-chan struct{}) {
+// ListenForEvents adds the given event callback into the listener set. The
+// returned callback will return the channel when called. The given callback
+// will be called in the main loop that listens for events, so any work should
+// be distributed to another thread.
+func (c *Connection) ListenForEvents(onEvent func(*Event)) func() {
 	c.lock.Lock()
 	c.lastListener++
 	id := c.lastListener
-	c.eventListeners[id] = events
+	c.eventListeners[id] = onEvent
 	c.lock.Unlock()
 
-	<-stop
-
-	c.lock.Lock()
-	delete(c.eventListeners, id)
-	close(events)
-	c.lock.Unlock()
-}
-
-// NewEventListener is a convenience wrapper around ListenForEvents(). It
-// creates and returns the event channel and the stop channel. After calling
-// NewEventListener, read events from the events channel and send an empty
-// struct to the stop channel to close it.
-func (c *Connection) NewEventListener() (chan *Event, chan struct{}) {
-	events := make(chan *Event)
-	stop := make(chan struct{})
-	go c.ListenForEvents(events, stop)
-	return events, stop
+	return func() {
+		c.lock.Lock()
+		delete(c.eventListeners, id)
+		c.lock.Unlock()
+	}
 }
 
 // Call calls an arbitrary command and returns its result. For a list of
 // possible functions, see https://mpv.io/manual/master/#commands and
 // https://mpv.io/manual/master/#list-of-input-commands
-func (c *Connection) Call(arguments ...interface{}) (interface{}, error) {
-	c.lock.Lock()
-	c.lastRequest++
-	id := c.lastRequest
-	resultChannel := make(chan *commandResult)
-	c.waitingRequests[id] = resultChannel
-	c.lock.Unlock()
+func (c *Connection) Call(arguments ...interface{}) (data interface{}, err error) {
+	finish := make(chan struct{})
 
-	defer func() {
-		c.lock.Lock()
-		close(c.waitingRequests[id])
-		delete(c.waitingRequests, id)
-		c.lock.Unlock()
-	}()
+	callErr := c.CallAsync(func(v interface{}, e error) {
+		data, err = v, e
+		finish <- struct{}{}
+	}, arguments...)
 
-	err := c.sendCommand(id, arguments...)
-	if err != nil {
+	if callErr != nil {
 		return nil, err
 	}
 
-	result := <-resultChannel
-	if result.Status == "success" {
-		return result.Data, nil
+	<-finish
+
+	return
+}
+
+// CallAsync does what Call does, but it does not block until there's a reply.
+// If f is nil, then no reply is waited. f is called in the main loop, so it
+// shouldn't do intensive work.
+func (c *Connection) CallAsync(f func(v interface{}, err error), args ...interface{}) error {
+	c.lock.Lock()
+
+	c.lastRequest++
+	id := c.lastRequest
+
+	if f != nil {
+		c.waitingRequests[id] = func(r *CommandResult) {
+			if r.Status == "success" {
+				f(r.Data, nil)
+			} else {
+				f(nil, fmt.Errorf("mpv error: %s", r.Status))
+			}
+
+			c.lock.Lock()
+			delete(c.waitingRequests, id)
+			c.lock.Unlock()
+		}
 	}
-	return nil, fmt.Errorf("mpv error: %s", result.Status)
+
+	c.lock.Unlock()
+
+	return c.SendCommand(id, args...)
 }
 
 // Set is a shortcut to Call("set_property", property, value)
 func (c *Connection) Set(property string, value interface{}) error {
 	_, err := c.Call("set_property", property, value)
 	return err
+}
+
+// SetAsync sets the property asynchronously. The returned error will only cover
+// sending. f is optional; if it is not nil, then it'll be called afterwards.
+func (c *Connection) SetAsync(property string, value interface{}, f func(error)) error {
+	var asyncFn func(interface{}, error)
+	if f != nil {
+		asyncFn = func(_ interface{}, err error) { f(err) }
+	}
+
+	return c.CallAsync(asyncFn, "set_property", property, value)
 }
 
 // Get is a shortcut to Call("get_property", property)
@@ -166,9 +179,6 @@ func (c *Connection) Close() error {
 
 	if c.client != nil {
 		err := c.client.Close()
-		for waiterID := range c.closeWaiters {
-			close(c.closeWaiters[waiterID])
-		}
 		c.client = nil
 		return err
 	}
@@ -187,33 +197,14 @@ func (c *Connection) Close() error {
 // It's ok to use IsClosed() to check if you need to reopen the connection
 // before calling a command.
 func (c *Connection) IsClosed() bool {
+	c.lock.Lock()
+	defer c.lock.Unlock()
+
 	return c.client == nil
 }
 
-// WaitUntilClosed blocks until the connection becomes closed. See IsClosed()
-// for an explanation of the closed state.
-func (c *Connection) WaitUntilClosed() {
-	c.lock.Lock()
-	if c.IsClosed() {
-		c.lock.Unlock()
-		return
-	}
-
-	closed := make(chan struct{})
-	c.lastCloseWaiter++
-	waiterID := c.lastCloseWaiter
-	c.closeWaiters[waiterID] = closed
-
-	c.lock.Unlock()
-
-	<-closed
-
-	c.lock.Lock()
-	delete(c.closeWaiters, waiterID)
-	c.lock.Unlock()
-}
-
-func (c *Connection) sendCommand(id uint, arguments ...interface{}) error {
+// SendCommand is the low level call to send a command.
+func (c *Connection) SendCommand(id uint, arguments ...interface{}) error {
 	if c.client == nil {
 		return fmt.Errorf("trying to send command on closed mpv client")
 	}
@@ -241,26 +232,25 @@ type commandRequest struct {
 	ID        uint          `json:"request_id"`
 }
 
-type commandResult struct {
+type CommandResult struct {
 	Status string      `json:"error"`
 	Data   interface{} `json:"data"`
 	ID     uint        `json:"request_id"`
 }
 
 func (c *Connection) checkResult(data []byte) {
-	result := &commandResult{}
-	err := json.Unmarshal(data, &result)
-	if err != nil {
+	result := CommandResult{}
+
+	if err := json.Unmarshal(data, &result); err != nil || result.Status == "" {
 		return // skip malformed data
 	}
-	if result.Status == "" {
-		return // not a result
-	}
+
 	c.lock.Lock()
-	request, ok := c.waitingRequests[result.ID]
+	request := c.waitingRequests[result.ID]
 	c.lock.Unlock()
-	if ok {
-		request <- result
+
+	if request != nil {
+		request(&result)
 	}
 }
 
@@ -276,9 +266,7 @@ func (c *Connection) checkEvent(data []byte) {
 	c.lock.Lock()
 	for listenerID := range c.eventListeners {
 		listener := c.eventListeners[listenerID]
-		go func() {
-			listener <- event
-		}()
+		listener(event)
 	}
 	c.lock.Unlock()
 }
@@ -290,5 +278,6 @@ func (c *Connection) listen() {
 		c.checkEvent(data)
 		c.checkResult(data)
 	}
-	_ = c.Close()
+
+	c.Close()
 }

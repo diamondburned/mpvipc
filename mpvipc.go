@@ -31,8 +31,8 @@ type Event struct {
 	Name string `json:"event"`
 
 	// Reason is the reason for the event: currently used for the "end-file"
-	// event. When Name is "end-file", possible values of Reason are:
-	// "eof", "stop", "quit", "error", "redirect", "unknown"
+	// event. When Name is "end-file", possible values of Reason are: "eof",
+	// "stop", "quit", "error", "redirect", "unknown"
 	Reason string `json:"reason"`
 
 	// Prefix is the log-message prefix (only if Name is "log-message")
@@ -44,7 +44,8 @@ type Event struct {
 	// Text is the text of a log-message (only if Name is "log-message")
 	Text string `json:"text"`
 
-	// ID is the user-set property ID (on events triggered by observed properties)
+	// ID is the user-set property ID (on events triggered by observed
+	// properties)
 	ID uint `json:"id"`
 
 	// Data is the property value (on events triggered by observed properties)
@@ -126,6 +127,10 @@ func (c *Connection) Call(arguments ...interface{}) (data interface{}, err error
 func (c *Connection) CallAsync(f func(v interface{}, err error), args ...interface{}) error {
 	c.lock.Lock()
 
+	if c.client == nil {
+		return fmt.Errorf("trying to send command on closed mpv client")
+	}
+
 	c.lastRequest++
 	id := c.lastRequest
 
@@ -143,9 +148,25 @@ func (c *Connection) CallAsync(f func(v interface{}, err error), args ...interfa
 		}
 	}
 
+	// Early copy the Conn so we can early release the mutex.
+	client := c.client
+
 	c.lock.Unlock()
 
-	return c.SendCommand(id, args...)
+	message := commandRequest{Arguments: args, ID: id}
+
+	data, err := json.Marshal(message)
+	if err != nil {
+		return fmt.Errorf("can't encode command: %s", err)
+	}
+	data = append(data, '\n') // add termination
+
+	_, err = client.Write(data)
+	if err != nil {
+		return fmt.Errorf("can't write command: %s", err)
+	}
+
+	return err
 }
 
 // Set is a shortcut to Call("set_property", property, value)
@@ -177,16 +198,24 @@ func (c *Connection) Close() error {
 	c.lock.Lock()
 	defer c.lock.Unlock()
 
-	if c.client != nil {
-		err := c.client.Close()
-		c.client = nil
-		return err
+	if c.client == nil {
+		return nil
 	}
-	return nil
+
+	err := c.client.Close()
+
+	c.eventListeners = make(map[uint]func(*Event))
+	c.lastListener = 0
+
+	c.waitingRequests = make(map[uint]func(*CommandResult))
+	c.lastRequest = 0
+
+	c.client = nil
+	return err
 }
 
-// IsClosed returns true if the connection is closed. There are several cases
-// in which a connection is closed:
+// IsClosed returns true if the connection is closed. There are several cases in
+// which a connection is closed:
 //
 // 1. Close() has been called
 //
@@ -201,30 +230,6 @@ func (c *Connection) IsClosed() bool {
 	defer c.lock.Unlock()
 
 	return c.client == nil
-}
-
-// SendCommand is the low level call to send a command.
-func (c *Connection) SendCommand(id uint, arguments ...interface{}) error {
-	if c.client == nil {
-		return fmt.Errorf("trying to send command on closed mpv client")
-	}
-	message := &commandRequest{
-		Arguments: arguments,
-		ID:        id,
-	}
-	data, err := json.Marshal(&message)
-	if err != nil {
-		return fmt.Errorf("can't encode command: %s", err)
-	}
-	_, err = c.client.Write(data)
-	if err != nil {
-		return fmt.Errorf("can't write command: %s", err)
-	}
-	_, err = c.client.Write([]byte("\n"))
-	if err != nil {
-		return fmt.Errorf("can't terminate command: %s", err)
-	}
-	return err
 }
 
 type commandRequest struct {
@@ -255,18 +260,15 @@ func (c *Connection) checkResult(data []byte) {
 }
 
 func (c *Connection) checkEvent(data []byte) {
-	event := &Event{}
-	err := json.Unmarshal(data, &event)
-	if err != nil {
+	event := Event{}
+
+	if err := json.Unmarshal(data, &event); err != nil || event.Name == "" {
 		return // skip malformed data
 	}
-	if event.Name == "" {
-		return // not an event
-	}
+
 	c.lock.Lock()
-	for listenerID := range c.eventListeners {
-		listener := c.eventListeners[listenerID]
-		listener(event)
+	for _, listener := range c.eventListeners {
+		listener(&event)
 	}
 	c.lock.Unlock()
 }
